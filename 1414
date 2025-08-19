@@ -1,0 +1,1 @@
+curl -X POST "http://your-grafana-url/api/ds/query?ds_type=__expr__&expression=true&requestId=Q100" -H "Content-Type: application/json" -d '{"queries":[{"datasource":{"name":"Expression","type":"__expr__","uid":"__expr__"},"hide":false,"refId":"B","type":"sql","window":""}]}'
