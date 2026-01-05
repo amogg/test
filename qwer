@@ -1,0 +1,112 @@
+/*
+ * Windows OpenSSL (libssl/ssleay32) Traffic Logger for Frida
+ * Tested on generic OpenSSL implementations.
+ */
+
+// 후킹할 대상 라이브러리 이름을 찾습니다.
+// 윈도우에서는 보통 'libssl-1_1-x64.dll', 'ssleay32.dll', 'libssl.dll' 등으로 다양합니다.
+function findSslModule() {
+    var modules = Process.enumerateModules();
+    var targetModule = null;
+
+    // 자주 사용되는 SSL 라이브러리 이름 패턴
+    var patterns = ["libssl", "ssleay32", "libcrypto"];
+
+    for (var i = 0; i < modules.length; i++) {
+        var name = modules[i].name.toLowerCase();
+        for (var j = 0; j < patterns.length; j++) {
+            if (name.indexOf(patterns[j]) !== -1) {
+                // libcrypto만 있고 libssl이 없는 경우도 있으므로 주의 필요하나,
+                // 통신 함수는 보통 libssl 계열에 있습니다.
+                if (name.indexOf("crypto") === -1 || patterns[j] === "libcrypto") {
+                    targetModule = modules[i].name;
+                    break;
+                }
+            }
+        }
+        if (targetModule) break;
+    }
+    return targetModule;
+}
+
+function hookSSL() {
+    var moduleName = findSslModule();
+
+    if (!moduleName) {
+        console.error("[-] SSL Library not found. Please specify the module name manually.");
+        console.log("[*] Loaded modules:");
+        Process.enumerateModules().forEach(function(m) {
+            console.log(" - " + m.name);
+        });
+        return;
+    }
+
+    console.log("[+] Found SSL Module: " + moduleName);
+
+    // 심볼 주소 찾기 (SSL_write, SSL_read)
+    var sslWriteAddr = Module.findExportByName(moduleName, "SSL_write");
+    var sslReadAddr = Module.findExportByName(moduleName, "SSL_read");
+
+    if (!sslWriteAddr || !sslReadAddr) {
+        console.error("[-] Could not find SSL_write or SSL_read exports in " + moduleName);
+        return;
+    }
+
+    console.log("[+] Hooking SSL_write at " + sslWriteAddr);
+    console.log("[+] Hooking SSL_read at " + sslReadAddr);
+
+    // 색상 코드 (가독성을 위함)
+    var COLOR_SEND = "\x1b[36m"; // Cyan
+    var COLOR_RECV = "\x1b[32m"; // Green
+    var COLOR_RESET = "\x1b[0m";
+
+    // SSL_write 후킹 (데이터 송신)
+    Interceptor.attach(sslWriteAddr, {
+        onEnter: function(args) {
+            // int SSL_write(SSL *ssl, const void *buf, int num);
+            var ssl = args[0];
+            var buf = args[1];
+            var num = args[2].toInt32();
+
+            if (num > 0) {
+                console.log(COLOR_SEND + "[+] SSL_write (Size: " + num + ")" + COLOR_RESET);
+                console.log(hexdump(buf, {
+                    offset: 0,
+                    length: num,
+                    header: false,
+                    ansi: true
+                }));
+                console.log("\n");
+            }
+        }
+    });
+
+    // SSL_read 후킹 (데이터 수신)
+    Interceptor.attach(sslReadAddr, {
+        onEnter: function(args) {
+            // int SSL_read(SSL *ssl, void *buf, int num);
+            // 함수 진입 시점에는 버퍼가 비어있으므로 포인터만 저장해둠
+            this.ssl = args[0];
+            this.buf = args[1];
+            this.num = args[2].toInt32();
+        },
+        onLeave: function(retval) {
+            // 함수가 리턴된 후, 실제로 읽은 바이트 수를 확인
+            var numRead = retval.toInt32();
+
+            if (numRead > 0) {
+                console.log(COLOR_RECV + "[+] SSL_read (Size: " + numRead + ")" + COLOR_RESET);
+                console.log(hexdump(this.buf, {
+                    offset: 0,
+                    length: numRead,
+                    header: false,
+                    ansi: true
+                }));
+                console.log("\n");
+            }
+        }
+    });
+}
+
+// 스크립트 로드 시 실행 (지연 로딩이 필요한 경우 setTimeout 사용 고려)
+setTimeout(hookSSL, 1000);
