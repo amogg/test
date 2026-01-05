@@ -1,0 +1,126 @@
+/*
+ * Windows OpenSSL (libssl/ssleay32) Traffic Logger
+ * Compatible with Frida 17.x+ (Strict Mode & New APIs)
+ */
+
+// Frida 17 대응: 모듈 찾기 로직 (Iterator 사용)
+function findSslModuleName() {
+    const patterns = ["libssl", "ssleay32", "libcrypto"];
+    
+    // Process.enumerateModules()가 17버전부터 Iterator를 반환할 수 있으므로 for...of 사용
+    for (const m of Process.enumerateModules()) {
+        const name = m.name.toLowerCase();
+        for (const pattern of patterns) {
+            if (name.includes(pattern)) {
+                // crypto만 있고 ssl이 없는 경우 제외 (보통 통신 함수는 ssl에 있음)
+                if (!name.includes("crypto") || pattern === "libcrypto") {
+                    return m.name;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+function hookSSL() {
+    // 1. 모듈 이름 찾기 (로깅용)
+    const moduleName = findSslModuleName();
+    
+    // 2. 주소 찾기: Frida 17에서는 Static Method인 Module.findExportByName이 제거됨
+    // 대신 Module.getGlobalExportByName(전역 검색)을 사용하거나
+    // 모듈 객체에서 .getExportByName()을 호출해야 함.
+    
+    let sslWriteAddr = null;
+    let sslReadAddr = null;
+
+    try {
+        // 방법 A: 가장 확실한 최신 API (전역 심볼 검색)
+        // 로드된 모든 모듈 중에서 SSL_write를 찾습니다.
+        sslWriteAddr = Module.getGlobalExportByName("SSL_write");
+        sslReadAddr = Module.getGlobalExportByName("SSL_read");
+    } catch (e) {
+        // 전역 검색 실패 시 (혹은 구버전 호환)
+        if (moduleName) {
+            try {
+                // 방법 B: 특정 모듈 인스턴스를 가져와서 찾기
+                const mod = Process.getModuleByName(moduleName);
+                sslWriteAddr = mod.getExportByName("SSL_write");
+                sslReadAddr = mod.getExportByName("SSL_read");
+            } catch (e2) {
+                console.error("[-] Failed to find exports in module: " + e2.message);
+            }
+        }
+    }
+
+    if (!sslWriteAddr || !sslReadAddr) {
+        console.error("[-] Could not find SSL_write or SSL_read addresses.");
+        console.log("[*] Tip: If the library is lazy-loaded, you might need to wait longer.");
+        return;
+    }
+
+    console.log("[+] Target Module: " + (moduleName ? moduleName : "Auto-detected"));
+    console.log("[+] Hooking SSL_write at " + sslWriteAddr);
+    console.log("[+] Hooking SSL_read at " + sslReadAddr);
+
+    const COLOR_SEND = "\x1b[36m"; 
+    const COLOR_RECV = "\x1b[32m"; 
+    const COLOR_RESET = "\x1b[0m";
+
+    // SSL_write Hook
+    Interceptor.attach(sslWriteAddr, {
+        onEnter(args) {
+            // Frida 17 Strict Mode 대응:
+            // args 요소가 NativePointer가 아닌 Primitive(Number/BigInt)일 수 있음.
+            // ptr()로 감싸서 NativePointer로 변환 후 .toInt32() 호출
+            
+            const buf = ptr(args[1]);
+            const num = ptr(args[2]).toInt32();
+
+            if (num > 0) {
+                console.log(`${COLOR_SEND}[+] SSL_write (Size: ${num})${COLOR_RESET}`);
+                try {
+                    console.log(hexdump(buf, {
+                        offset: 0,
+                        length: num,
+                        header: false,
+                        ansi: true
+                    }));
+                } catch (e) {
+                    console.log("[!] Hexdump error: " + e.message);
+                }
+                console.log("\n");
+            }
+        }
+    });
+
+    // SSL_read Hook
+    Interceptor.attach(sslReadAddr, {
+        onEnter(args) {
+            this.buf = ptr(args[1]);
+            this.num = ptr(args[2]).toInt32();
+            this.ssl = args[0]; // Context 저장
+        },
+        onLeave(retval) {
+            // 리턴값 처리도 ptr()로 감싸기
+            const numRead = ptr(retval).toInt32();
+
+            if (numRead > 0) {
+                console.log(`${COLOR_RECV}[+] SSL_read (Size: ${numRead})${COLOR_RESET}`);
+                try {
+                    console.log(hexdump(this.buf, {
+                        offset: 0,
+                        length: numRead,
+                        header: false,
+                        ansi: true
+                    }));
+                } catch (e) {
+                    console.log("[!] Hexdump error: " + e.message);
+                }
+                console.log("\n");
+            }
+        }
+    });
+}
+
+// 초기화 지연 (프로세스 로딩 시간 고려)
+setTimeout(hookSSL, 1000);
