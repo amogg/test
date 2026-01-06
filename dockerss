@@ -1,0 +1,167 @@
+import os
+import json
+import hashlib
+import tarfile
+import shutil
+import requests
+import sys
+
+# ==========================================
+# 설정 입력 (이 부분을 수정해서 사용하세요)
+# ==========================================
+REGISTRY_URL = "https://nexus.example.com:8082"  # Nexus Docker 레지스트리 주소
+IMAGE_NAME = "my-project/my-image"               # 이미지 이름 (네임스페이스 포함)
+TAG = "latest"                                   # 태그
+USERNAME = "admin"                               # Nexus ID
+PASSWORD = "password123"                         # Nexus PW
+OUTPUT_FILENAME = "my-image.tar"                 # 저장할 파일명
+# ==========================================
+
+# SSL 인증서 검증 무시 (사설 인증서 사용 시 True로 설정)
+VERIFY_SSL = False 
+if not VERIFY_SSL:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class DockerDownloader:
+    def __init__(self, registry, image, tag, user, password):
+        self.registry = registry.rstrip('/')
+        self.image = image
+        self.tag = tag
+        self.auth = (user, password)
+        self.session = requests.Session()
+        self.session.verify = VERIFY_SSL
+        self.token = None
+
+    def _get_headers(self, accept_manifest=False):
+        headers = {}
+        if accept_manifest:
+            headers['Accept'] = 'application/vnd.docker.distribution.manifest.v2+json'
+        
+        if self.token:
+            headers['Authorization'] = f'Bearer {self.token}'
+        return headers
+
+    def authenticate(self):
+        """Nexus(Basic Auth) 및 Token Auth 처리"""
+        print(f"[*] Authenticating to {self.registry}...")
+        
+        # 1. 먼저 Basic Auth로 시도 (Nexus는 주로 이 방식)
+        self.session.auth = self.auth
+        resp = self.session.get(f"{self.registry}/v2/", headers=self._get_headers())
+        
+        # 2. 401 발생 시 Token Auth 시도 (Www-Authenticate 헤더 파싱)
+        if resp.status_code == 401 and 'Www-Authenticate' in resp.headers:
+            auth_header = resp.headers['Www-Authenticate']
+            if 'Bearer' in auth_header:
+                print(" -> Basic Auth failed, attempting Token Auth...")
+                self.session.auth = None # Basic Auth 해제
+                
+                # Realm, Service, Scope 파싱 (간단한 파싱 로직)
+                parts = auth_header.replace('Bearer ', '').replace('"', '').split(',')
+                params = {k.strip(): v.strip() for k, v in [p.split('=') for p in parts]}
+                
+                token_url = params.get('realm')
+                service = params.get('service')
+                scope = f"repository:{self.image}:pull"
+                
+                token_resp = requests.get(
+                    token_url, 
+                    params={'service': service, 'scope': scope}, 
+                    auth=self.auth, 
+                    verify=VERIFY_SSL
+                )
+                
+                if token_resp.status_code == 200:
+                    self.token = token_resp.json().get('token')
+                    print(" -> Token acquired.")
+                else:
+                    raise Exception(f"Token auth failed: {token_resp.text}")
+
+        elif resp.status_code not in [200, 401]:
+             print(f"Warning: Auth check returned {resp.status_code}, trying to proceed...")
+
+    def download_image(self):
+        # 1. Manifest 가져오기
+        print(f"[*] Fetching manifest for {self.image}:{self.tag}...")
+        manifest_url = f"{self.registry}/v2/{self.image}/manifests/{self.tag}"
+        resp = self.session.get(manifest_url, headers=self._get_headers(accept_manifest=True))
+        
+        if resp.status_code != 200:
+            raise Exception(f"Failed to get manifest: {resp.status_code} {resp.text}")
+        
+        manifest = resp.json()
+        
+        # 스키마 버전 확인 (v2 schema 2만 지원하도록 작성됨)
+        if manifest.get('schemaVersion') != 2:
+            raise Exception("This script supports Docker V2 Schema 2 manifests only.")
+
+        config_digest = manifest['config']['digest']
+        layers = manifest['layers']
+
+        # 임시 디렉토리 생성
+        tmp_dir = "tmp_docker_build"
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir)
+
+        try:
+            # 2. Config Blob 다운로드
+            print(f"[*] Downloading Config Blob ({config_digest})...")
+            config_filename = f"{config_digest.split(':')[1]}.json"
+            self._download_blob(config_digest, os.path.join(tmp_dir, config_filename))
+
+            # 3. Layer Blobs 다운로드
+            layer_paths = []
+            for layer in layers:
+                digest = layer['digest']
+                layer_id = digest.split(':')[1]
+                print(f"[*] Downloading Layer ({layer_id})...")
+                
+                # Docker Save 호환 구조: 각 레이어는 별도 폴더 내 layer.tar로 저장
+                layer_dir = os.path.join(tmp_dir, layer_id)
+                os.makedirs(layer_dir, exist_ok=True)
+                
+                layer_filename = os.path.join(layer_dir, "layer.tar")
+                self._download_blob(digest, layer_filename)
+                
+                layer_paths.append(f"{layer_id}/layer.tar")
+
+            # 4. manifest.json 생성 (docker load용)
+            print("[*] Creating manifest.json...")
+            docker_manifest = [{
+                "Config": config_filename,
+                "RepoTags": [f"{self.image}:{self.tag}"],
+                "Layers": layer_paths
+            }]
+            
+            with open(os.path.join(tmp_dir, 'manifest.json'), 'w') as f:
+                json.dump(docker_manifest, f)
+
+            # 5. Tar 파일로 묶기
+            print(f"[*] Packaging into {OUTPUT_FILENAME}...")
+            with tarfile.open(OUTPUT_FILENAME, "w") as tar:
+                tar.add(tmp_dir, arcname=".")
+            
+            print(f"\n[Success] Saved to {OUTPUT_FILENAME}")
+            print(f"Now you can run: docker load -i {OUTPUT_FILENAME}")
+
+        finally:
+            # 정리
+            shutil.rmtree(tmp_dir)
+
+    def _download_blob(self, digest, save_path):
+        url = f"{self.registry}/v2/{self.image}/blobs/{digest}"
+        with self.session.get(url, stream=True, headers=self._get_headers()) as r:
+            r.raise_for_status()
+            with open(save_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+if __name__ == "__main__":
+    try:
+        downloader = DockerDownloader(REGISTRY_URL, IMAGE_NAME, TAG, USERNAME, PASSWORD)
+        downloader.authenticate()
+        downloader.download_image()
+    except Exception as e:
+        print(f"\n[Error] {e}")
