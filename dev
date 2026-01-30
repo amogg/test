@@ -1,0 +1,70 @@
+/* * [All Network Request Sniffer]
+ * XMLHttpRequest & Fetch API 모두 가로채기
+ */
+
+(function() {
+    // ============================================================
+    // 1. XMLHttpRequest (XHR) 후킹
+    // ============================================================
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+
+    // URL을 저장하기 위해 open도 후킹합니다.
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._url = url; // 나중에 로그 찍을 때 쓰려고 저장
+        this._method = method;
+        return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+        console.group('%c[XHR Hook] Request Detected', 'color: red; font-weight: bold;');
+        console.log(`Target URL: ${this._method} ${this._url}`);
+        console.log('Body Data (Encryption Check):', body);
+        
+        console.log('%c[!] Call Stack (Who called send?)', 'color: blue;');
+        console.trace(); // ★ 누가 호출했는지 추적
+        console.groupEnd();
+
+        // ★ 여기서 멈춥니다! 
+        // Call Stack을 확인해서 바로 이전 단계 함수를 클릭해 들어가세요.
+        debugger; 
+
+        return originalSend.apply(this, arguments);
+    };
+
+
+    // ============================================================
+    // 2. Fetch API 후킹 (요즘 사이트는 이걸 더 많이 씀)
+    // ============================================================
+    const originalFetch = window.fetch;
+
+    window.fetch = async function(input, init) {
+        let url = input;
+        let body = "No Body";
+
+        // input이 Request 객체인 경우 처리
+        if (typeof input === 'object' && input.url) {
+            url = input.url;
+        }
+        
+        // init에 바디가 있는 경우
+        if (init && init.body) {
+            body = init.body;
+        }
+
+        console.group('%c[Fetch Hook] Request Detected', 'color: magenta; font-weight: bold;');
+        console.log(`Target URL: ${url}`);
+        console.log('Body Data (Encryption Check):', body);
+
+        console.log('%c[!] Call Stack (Who called fetch?)', 'color: blue;');
+        console.trace(); // ★ 누가 호출했는지 추적
+        console.groupEnd();
+
+        // ★ 여기서 멈춥니다!
+        debugger;
+
+        return originalFetch.apply(this, arguments);
+    };
+
+    console.log("%c[+] Network Sniffer Activated (XHR + Fetch)", "background: #222; color: #bada55; font-size: 16px;");
+})();
